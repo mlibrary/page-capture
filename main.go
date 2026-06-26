@@ -131,8 +131,8 @@ end run
 
 func main() {
 	targetDir := flag.String("target-dir", "", "Directory to write capture output (required)")
-	chrome := flag.Bool("chrome", false, "Force Chrome capture backend")
-	safari := flag.Bool("safari", false, "Force Safari capture backend (default)")
+	chrome := flag.Bool("chrome", false, "Force Chrome capture backend (default)")
+	safari := flag.Bool("safari", false, "Force Safari capture backend (Mac only)")
 	help := flag.Bool("help", false, "Show help and exit")
 	helpShort := flag.Bool("h", false, "Show help and exit")
 
@@ -141,7 +141,7 @@ func main() {
 		program := filepath.Base(os.Args[0])
 		out := flag.CommandLine.Output()
 		fmt.Fprintf(out, "Usage:\n  %s [--chrome|--safari] --target-dir <dir> <URL>\n\n", program)
-		fmt.Fprintf(out, "Examples:\n  %s --target-dir captures/test https://example.com\n  %s --chrome --target-dir captures/test https://example.com\n\n", program, program)
+		fmt.Fprintf(out, "Examples:\n  %s --target-dir captures/test https://example.com\n  %s --safari --target-dir captures/test https://example.com\n\n", program, program)
 		fmt.Fprintln(out, "Options:")
 		flag.PrintDefaults()
 	}
@@ -211,10 +211,10 @@ func resolveBackend(chrome, safari bool) (browserBackend, error) {
 	if chrome && safari {
 		return "", errors.New("--chrome and --safari are mutually exclusive")
 	}
-	if chrome {
-		return backendChrome, nil
+	if safari {
+		return backendSafari, nil
 	}
-	return backendSafari, nil
+	return backendChrome, nil
 }
 
 func validateURL(raw string) error {
