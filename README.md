@@ -16,8 +16,8 @@ Usage:
 
 Options:
   --target-dir string   Directory to write capture output (required)
-  --chrome              Force Chrome capture backend
-  --safari              Force Safari capture backend (default)
+  --chrome              Force Chrome capture backend (default)
+  --safari              Force Safari capture backend (Mac-only)
   --help, -h            Show help and exit
 ```
 
