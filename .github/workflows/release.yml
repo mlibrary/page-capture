@@ -1,0 +1,71 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [go.mod, main.go]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.value }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          name="page-capture-${{ matrix.goos }}-${{ matrix.goarch }}"
+          go build -o "$name" .
+          sha256sum "$name" > "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: page-capture-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            page-capture-${{ matrix.goos }}-${{ matrix.goarch }}
+            page-capture-${{ matrix.goos }}-${{ matrix.goarch }}.sha256
+
+      - id: tag
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: echo "value=v0.0.0-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: layout artifacts
+        run: |
+          mkdir release-assets
+          find artifacts -type f | while read f; do
+            cp "$f" release-assets/
+          done
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: "page-capture ${{ needs.build.outputs.tag }}"
+          body: |
+            Built from ${{ github.sha }}
+            Triggered by: ${{ github.event.head_commit.message }}
+          prerelease: true
+          files: release-assets/*
