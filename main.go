@@ -1,3 +1,19 @@
+// Command page-capture captures a rendered webpage to static files.
+//
+// It produces three output files in a target directory:
+//   - index.html     — rendered DOM with data-source-url + data-computed-css annotations
+//   - styles.css     — all CSS rules (inline, @import, cssRules)
+//   - screenshot.png — full-viewport screenshot
+//
+// Backends:
+//   - chrome (default) — chromedp / headless Chrome via DevTools Protocol
+//   - safari (--safari) — osascript + screencapture (macOS only)
+//
+// The key feature: the injected JS walks every element, computes effective
+// CSS via window.getComputedStyle, and stores non-default property values
+// in data-computed-css attributes. This enables offline analysis of what
+// each element actually renders, independent of external stylesheets that
+// won't load in a non-browser context.
 package main
 
 import (
@@ -17,11 +33,14 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+// Viewport dimensions for the headless Chrome window.
+// 1280x1200 fits most content pages with minimal wasted space.
 const (
 	viewportWidth  = 1280
 	viewportHeight = 1200
 )
 
+// browserBackend identifies which browser engine drives the capture.
 type browserBackend string
 
 const (
@@ -29,10 +48,49 @@ const (
 	backendChrome browserBackend = "chrome"
 )
 
+// captureDOMJS is injected into every captured page (chrome backend only).
+// It does three things:
+//  1. Annotates <html> with data-source-url (the actual URL) and data-browser.
+//  2. Walks every visible body element and calls window.getComputedStyle(el)
+//     for a curated set of CSS properties (layout, color, font, flex/grid, etc.).
+//     Properties whose value matches the browser default are skipped so only
+//     non-default / explicit values are recorded in data-computed-css.
+//  3. Returns the full outerHTML of <html>, base64-encoded to avoid encoding
+//     issues when passing through osascript or chromedp Evaluate().
+//
+// Default-value filters (position:static, display:inline, visibility:visible,
+// overflow:visible, z-index:auto, box-sizing:content-box, 0px margins/padding,
+// transparent backgrounds, etc.) keep the attribute size manageable.
 const captureDOMJS = `(function(){if(!document.documentElement){return '';}var url=window.location.href||'';var browser='__CAPTURE_BROWSER__';document.documentElement.setAttribute('data-source-url',url);document.documentElement.setAttribute('data-browser',browser);var head=document.head||document.getElementsByTagName('head')[0];if(head){var meta=document.createElement('meta');meta.setAttribute('name','capture-source-url');meta.setAttribute('content',url);head.appendChild(meta);}var targetedProps=['width','height','color','background-color','display','position','margin','padding','font-size','font-family','flex-direction','grid-template-columns','opacity','visibility','z-index','box-sizing','overflow','text-align'];var excludedTags=['SCRIPT','STYLE','META','LINK','TEMPLATE','NOSCRIPT','HEAD','TITLE'];function compileFor(el){var computed=window.getComputedStyle(el);if(!computed){return '';}if(computed.getPropertyValue('display')==='none'){return '';}var out='';for(var i=0;i<targetedProps.length;i++){var prop=targetedProps[i];var value=computed.getPropertyValue(prop);if(!value){continue;}if(value==='none'||value==='normal'||value==='rgba(0, 0, 0, 0)'){continue;}if(prop==='position'&&value==='static'){continue;}if(prop==='display'&&value==='inline'){continue;}if(prop==='z-index'&&value==='auto'){continue;}if(prop==='visibility'&&value==='visible'){continue;}if((prop==='margin'||prop==='padding')&&(value==='0px'||value==='0px 0px')){continue;}if(prop==='overflow'&&value==='visible'){continue;}if(prop==='box-sizing'&&value==='content-box'){continue;}out += prop + ': ' + value + '; ';}return out.trim();}var htmlCSS=compileFor(document.documentElement);if(htmlCSS){document.documentElement.setAttribute('data-computed-css',htmlCSS);}var bodyElements=document.querySelectorAll('body, body *');for(var j=0;j<bodyElements.length;j++){var el=bodyElements[j];if(excludedTags.indexOf(el.tagName)>=0){continue;}var css=compileFor(el);if(css){el.setAttribute('data-computed-css',css);}}return btoa(unescape(encodeURIComponent(document.documentElement.outerHTML)));})()`
 
+// captureCSSJS collects all CSS sent to the browser.
+// Sources (in priority order):
+//  1. <style> tags — raw textContent
+//  2. <link rel="stylesheet"> tags — emitted as @import url(...)
+//  3. document.styleSheets — accesses resolved cssRules (catches cross-origin
+//     sheets that throw on access, those are silently skipped in catch(e){})
+// Returns everything base64-encoded for safe transport through osascript.
 const captureCSSJS = `(function(){let c='';for(let s of document.querySelectorAll('style')){c+=(s.textContent||'')+'\n';}for(let l of document.querySelectorAll('link[href]')){let rel=(l.rel||'').toLowerCase();if(!rel.includes('stylesheet')){continue;}let h=l.href||'';if(h){c += '@import url(' + JSON.stringify(h) + ');\n';}}for(let s of document.styleSheets){try{for(let r of s.cssRules){c += r.cssText + '\n';}}catch(e){}}return btoa(unescape(encodeURIComponent(c)));})()`
 
+// captureSafariAppleScript is the osascript program that automates Safari.
+// It receives 6 positional arguments:
+//   1. target URL
+//   2. output path for the HTML file (base64-encoded DOM)
+//   3. output path for the CSS file (base64-encoded styles)
+//   4. output path for the PNG screenshot
+//   5. the DOM/JS capture script to evaluate
+//   6. the CSS capture script to evaluate
+//
+// Workflow:
+//   1. Opens Safari, navigates to target URL
+//   2. Polls document.readyState until "complete" (up to 60s, 500ms intervals)
+//   3. Evaluates the DOM and CSS JS scripts in the page context
+//   4. Writes base64 results to HTML and CSS files via AppleScript file I/O
+//   5. Uses macOS screencapture -x -R to capture the window region
+//   6. Closes the Safari window
+//
+// The try/on-error block ensures file handles and the browser window are
+// cleaned up even when capture fails.
 const captureSafariAppleScript = `
 on run argv
 	if (count of argv) is not 6 then error "expected 6 args"
@@ -129,6 +187,15 @@ on run argv
 end run
 `
 
+// main parses flags, validates input, resolves the browser backend, and
+// orchestrates the capture + post-processing pipeline.
+//
+// Pipeline order:
+//  1. capture()                   — drive browser to get DOM, CSS, screenshot
+//  2. decodeBase64CaptureFile()   — decode base64 HTML → plain text
+//  3. decodeBase64CaptureFile()   — decode base64 CSS  → plain text
+//  4. prependCSSMetadata()        — add source URL + backend to styles.css
+//  5. injectStylesheetLink()      — add <link rel="stylesheet"> to index.html
 func main() {
 	targetDir := flag.String("target-dir", "", "Directory to write capture output (required)")
 	chrome := flag.Bool("chrome", false, "Force Chrome capture backend (default)")
@@ -207,6 +274,9 @@ func main() {
 	fmt.Printf("saved: %s\n", pngPath)
 }
 
+// resolveBackend decides which browser backend to use.
+// --safari overrides the default chrome; --chrome is explicit default.
+// Returns an error if both are set.
 func resolveBackend(chrome, safari bool) (browserBackend, error) {
 	if chrome && safari {
 		return "", errors.New("--chrome and --safari are mutually exclusive")
@@ -217,6 +287,9 @@ func resolveBackend(chrome, safari bool) (browserBackend, error) {
 	return backendChrome, nil
 }
 
+// validateURL checks that the target URL has a valid http/https scheme and host.
+// url.Parse accepts many edge cases (empty strings, scheme-only), so we
+// explicitly verify scheme and host presence.
 func validateURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -231,6 +304,7 @@ func validateURL(raw string) error {
 	return nil
 }
 
+// capture dispatches to the appropriate backend implementation.
 func capture(targetURL, htmlPath, cssPath, pngPath string, backend browserBackend) error {
 	switch backend {
 	case backendSafari:
@@ -242,10 +316,20 @@ func capture(targetURL, htmlPath, cssPath, pngPath string, backend browserBacken
 	}
 }
 
+// captureDOMScript returns the DOM capture JS with __CAPTURE_BROWSER__
+// replaced by the actual backend name.
 func captureDOMScript(backend browserBackend) string {
 	return strings.ReplaceAll(captureDOMJS, "__CAPTURE_BROWSER__", string(backend))
 }
 
+// captureWithSafari drives Safari via osascript.
+//
+// Pipes the embedded AppleScript to osascript -, passing the target URL,
+// file paths, and JS scripts as positional args. The AppleScript opens
+// Safari, waits for page load, runs JS, writes files, takes a screenshot
+// with screencapture, then closes the window.
+//
+// Error recovery uses stderr first, then stdout, then the Go exec error.
 func captureWithSafari(targetURL, htmlPath, cssPath, pngPath string) error {
 	cmd := exec.Command(
 		"osascript",
@@ -277,6 +361,21 @@ func captureWithSafari(targetURL, htmlPath, cssPath, pngPath string) error {
 	return nil
 }
 
+// captureWithChrome uses chromedp to drive headless Chrome via DevTools Protocol.
+//
+// Setup:
+//  1. Creates an ExecAllocator with DefaultExecAllocatorOptions + window size
+//  2. Tries to find a local Chrome executable
+//  3. Creates a browser context with a 120s timeout
+//
+// Actions (single chromedp.Run batch):
+//  1. Navigate to the target URL
+//  2. Poll until document.readyState == "complete"
+//  3. Evaluate the DOM capture JS (returns base64 outerHTML)
+//  4. Evaluate the CSS capture JS (returns base64 styles)
+//  5. Capture a full-viewport screenshot
+//
+// Writes raw results to disk; base64 decoding happens in post-processing.
 func captureWithChrome(targetURL, htmlPath, cssPath, pngPath string) error {
 	allocOptions := append([]chromedp.ExecAllocatorOption{}, chromedp.DefaultExecAllocatorOptions[:]...)
 	allocOptions = append(allocOptions, chromedp.WindowSize(viewportWidth, viewportHeight))
@@ -327,6 +426,13 @@ func captureWithChrome(targetURL, htmlPath, cssPath, pngPath string) error {
 	return nil
 }
 
+// waitForPageReady returns a chromedp ActionFunc that polls
+// document.readyState and the current URL until the page is fully
+// loaded with a meaningful URL.
+//
+// Polls every 500ms for up to 240 iterations (120s total). Returns early
+// if the context is cancelled. The "about:blank" check prevents capturing
+// a blank tab that hasn't started navigation.
 func waitForPageReady() chromedp.ActionFunc {
 	return func(ctx context.Context) error {
 		for i := 0; i < 240; i++ {
@@ -354,6 +460,14 @@ func waitForPageReady() chromedp.ActionFunc {
 	}
 }
 
+// findChromeExecPath locates a Chrome/Chromium executable on macOS.
+//
+// Search order:
+//  1. Standard /Applications paths (Google Chrome, Chrome Canary)
+//  2. PATH lookup (google-chrome, chrome, chromium, chromium-browser)
+//
+// Returns the path and true if found, empty string and false otherwise.
+// When not found, chromedp falls back to its own discovery.
 func findChromeExecPath() (string, bool) {
 	macCandidates := []string{
 		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -376,6 +490,11 @@ func findChromeExecPath() (string, bool) {
 	return "", false
 }
 
+// decodeBase64CaptureFile reads a base64-encoded file and replaces it
+// with the decoded bytes.
+//
+// Both the DOM and CSS capture scripts return base64 to avoid encoding
+// issues through osascript or chromedp Evaluate(). This reverses that.
 func decodeBase64CaptureFile(path string) error {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -390,6 +509,8 @@ func decodeBase64CaptureFile(path string) error {
 	return os.WriteFile(path, decoded, 0o644)
 }
 
+// prependCSSMetadata adds a comment header to styles.css with the source
+// URL and browser backend, making it easy to trace CSS back to its origin.
 func prependCSSMetadata(cssPath, sourceURL string, backend browserBackend) error {
 	raw, err := os.ReadFile(cssPath)
 	if err != nil {
@@ -402,6 +523,11 @@ func prependCSSMetadata(cssPath, sourceURL string, backend browserBackend) error
 	return os.WriteFile(cssPath, content, 0o644)
 }
 
+// injectStylesheetLink adds <link rel="stylesheet" href="styles.css"> just
+// before </head> in the captured HTML. Makes the page render correctly when
+// opened locally, since original external stylesheet refs won't work offline.
+//
+// Skips if styles.css is already linked (idempotent).
 func injectStylesheetLink(htmlPath string) error {
 	raw, err := os.ReadFile(htmlPath)
 	if err != nil {
@@ -422,12 +548,16 @@ func injectStylesheetLink(htmlPath string) error {
 	return os.WriteFile(htmlPath, []byte(patched), 0o644)
 }
 
+// fatalUsagef prints an error message, shows flag usage, and exits with code 2.
+// Used for invalid CLI arguments.
 func fatalUsagef(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n\n", args...)
 	flag.Usage()
 	os.Exit(2)
 }
 
+// fatalf prints an error message to stderr and exits with code 2.
+// Used for runtime errors where usage is not relevant.
 func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 	os.Exit(2)
